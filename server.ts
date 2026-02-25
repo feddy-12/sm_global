@@ -6,8 +6,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
-import fs from "fs";
-import fsPromises from "fs/promises";
 
 console.log("Environment check - SID present:", !!process.env.TWILIO_ACCOUNT_SID);
 
@@ -43,12 +41,10 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // Debug Twilio and DB
   app.get("/api/debug-twilio", (req, res) => {
     res.json({
       hasSid: !!process.env.TWILIO_ACCOUNT_SID,
@@ -81,8 +77,9 @@ async function startServer() {
     const { email, password } = req.body;
     try {
       const [rows]: any = await pool.execute("SELECT * FROM users WHERE email = ?", [email]);
-      if (rows.length === 0) return res.status(401).json({ error: "Usuario no encontrado" });
-
+      if (rows.length === 0) {
+        return res.status(401).json({ error: "Usuario no encontrado" });
+      }
       const user = rows[0];
       const match = await bcrypt.compare(password, user.password);
       if (match) {
@@ -104,9 +101,10 @@ async function startServer() {
     try {
       const connection = await pool.getConnection();
       await connection.beginTransaction();
+
       try {
         // Sync Customers
-        if (customers?.length) {
+        if (customers && customers.length > 0) {
           for (const c of customers) {
             await connection.execute(
               `INSERT INTO customers (id, fullName, phone, address, dni, email) 
@@ -118,12 +116,14 @@ async function startServer() {
         }
 
         // Sync Users
-        if (users?.length) {
+        if (users && users.length > 0) {
           for (const u of users) {
             let passwordToStore = u.password || '123';
-            if (!passwordToStore.startsWith('$2')) {
+            // Solo encriptar si no parece ser un hash ya existente (bcrypt hashes start with $2)
+            if (passwordToStore && !passwordToStore.startsWith('$2')) {
               passwordToStore = await bcrypt.hash(passwordToStore, 10);
             }
+
             await connection.execute(
               `INSERT INTO users (id, name, email, role, branch, password) 
                VALUES (?, ?, ?, ?, ?, ?) 
@@ -134,7 +134,7 @@ async function startServer() {
         }
 
         // Sync Parcels
-        if (parcels?.length) {
+        if (parcels && parcels.length > 0) {
           for (const p of parcels) {
             await connection.execute(
               `INSERT INTO parcels (id, trackingCode, senderId, receiverName, receiverPhone, receiverAddress, weight, type, cost, status, paymentMethod, paymentStatus, origin, destination, createdAt, branch, createdById) 
@@ -148,7 +148,8 @@ async function startServer() {
               ]
             );
 
-            if (p.history?.length) {
+            // Sync History for this parcel
+            if (p.history && p.history.length > 0) {
               for (const h of p.history) {
                 await connection.execute(
                   `INSERT INTO tracking_history (parcelId, status, note, updatedAt) 
@@ -174,15 +175,22 @@ async function startServer() {
     }
   });
 
-  // Twilio SMS Endpoint
+  // API Route for Twilio SMS
   app.post("/api/notify-sms", async (req, res) => {
+    console.log("SMS Request received:", req.body);
     const { to, message } = req.body;
+
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_PHONE_NUMBER;
 
     if (!accountSid || !authToken || !fromNumber) {
-      return res.status(500).json({ error: "Configuración de Twilio incompleta." });
+      console.error("Twilio credentials missing:", {
+        hasSid: !!accountSid,
+        hasToken: !!authToken,
+        hasPhone: !!fromNumber
+      });
+      return res.status(500).json({ error: "Configuración de Twilio incompleta en el servidor." });
     }
 
     try {
@@ -192,47 +200,51 @@ async function startServer() {
         from: fromNumber,
         to: to,
       });
+
+      console.log(`SMS sent: ${response.sid}`);
       res.json({ success: true, sid: response.sid });
     } catch (error: any) {
+      console.error("Twilio Error:", error);
       res.status(500).json({ error: error.message || "Error al enviar el SMS." });
     }
   });
 
-  // Vite middleware para desarrollo
+  // Vite middleware for development or if dist is missing
   const isProduction = process.env.NODE_ENV === "production";
   const distPath = path.join(__dirname, "dist");
-  const distExists = fs.existsSync(distPath);
+  const distExists = await import("fs").then(fs => fs.existsSync(distPath));
 
   if (!isProduction || !distExists) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
+    
     app.use(vite.middlewares);
-
+    
+    // Manual SPA Fallback for Development
     app.use(async (req, res, next) => {
-      if (req.originalUrl.startsWith('/api')) return next();
+      const url = req.originalUrl;
+      if (url.startsWith('/api')) return next();
+      
       try {
-        let template = await fsPromises.readFile(path.resolve(__dirname, "index.html"), "utf-8");
-        template = await vite.transformIndexHtml(req.originalUrl, template);
+        const fs = await import("fs/promises");
+        let template = await fs.readFile(path.resolve(__dirname, "index.html"), "utf-8");
+        template = await vite.transformIndexHtml(url, template);
         res.status(200).set({ "Content-Type": "text/html" }).end(template);
       } catch (e) {
         vite.ssrFixStacktrace(e as Error);
         next(e);
       }
     });
-
-    console.log(`Vite middleware loaded (${!isProduction ? 'Development' : 'Production fallback'})`);
+    
+    console.log(`Vite middleware loaded (${!isProduction ? 'Development' : 'Production fallback because dist/ is missing'})`);
   } else {
-    // Producción: servir dist
     app.use(express.static(distPath));
-
-    // SPA fallback seguro usando app.use()
-    app.use((req, res, next) => {
-      if (req.originalUrl.startsWith("/api")) return next();
+    // SPA Fallback for production
+    app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
-
     console.log("Serving static files from dist/ in production mode");
   }
 
