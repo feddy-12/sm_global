@@ -227,8 +227,9 @@ async function startServer() {
     // Producción: servir dist
     app.use(express.static(distPath));
 
-    // SPA fallback seguro
-    app.get("/*", (req, res) => {
+    // SPA fallback seguro usando app.use()
+    app.use((req, res, next) => {
+      if (req.originalUrl.startsWith("/api")) return next();
       res.sendFile(path.join(distPath, "index.html"));
     });
 
