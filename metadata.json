@@ -1,0 +1,7 @@
+{
+  "name": "GE-Express - Gestión de Paquetería",
+  "description": "Sistema profesional de gestión de envíos para Guinea Ecuatorial, con seguimiento en tiempo real, facturación y reportes inteligentes.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
